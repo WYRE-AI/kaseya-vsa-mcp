@@ -108,6 +108,11 @@ export function createMcpServer(credentialOverrides?: KaseyaVsaCredentials): Ser
       capabilities: {
         tools: {},
         resources: {},
+        extensions: {
+          "io.modelcontextprotocol/ui": {
+            mimeTypes: ["text/html;profile=mcp-app"],
+          },
+        },
       },
     }
   );
@@ -431,6 +436,15 @@ export function createMcpServer(credentialOverrides?: KaseyaVsaCredentials): Ser
           // renders from. Best-effort — a null card just means no UI surface.
           const card = buildDeviceCard(agent as Partial<VsaAgent> | undefined);
           const payload = card ? { ...(agent as object), _card: card } : agent;
+          if (card) {
+            const summary = `${card.name ?? "Agent"}${card.status ? ` is ${card.status}` : ""}${
+              card.operatingSystem ? ` (${card.operatingSystem})` : ""
+            }.`;
+            return {
+              content: [{ type: "text", text: summary }],
+              structuredContent: payload as Record<string, unknown>,
+            };
+          }
           return { content: [{ type: "text", text: JSON.stringify(payload ?? {}, null, 2) }] };
         }
 

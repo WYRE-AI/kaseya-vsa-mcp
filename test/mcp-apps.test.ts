@@ -147,7 +147,7 @@ describe("MCP Apps device card", () => {
   });
 
   describe("kaseya_vsa_get_agent result", () => {
-    it("carries the normalized _card payload alongside the raw agent", async () => {
+    it("carries the normalized _card payload in structuredContent, with a plain-text summary in content", async () => {
       mockAgentsGet.mockResolvedValue(onlineAgent);
       const client = await connect();
       const result = await client.callTool({
@@ -155,9 +155,13 @@ describe("MCP Apps device card", () => {
         arguments: { agentId: onlineAgent.AgentId },
       });
       expect(result.isError).toBeFalsy();
+      // content is a short human-readable summary, not a JSON dump.
       const [first] = result.content as Array<{ type: string; text: string }>;
-      const payload = JSON.parse(first.text);
-      // Model-visible payload unchanged apart from the added _card.
+      expect(first.text).not.toMatch(/^[{[]/);
+      expect(first.text).toContain("srv-dc01.acme");
+      expect(first.text).toContain("Online");
+      // structuredContent carries the model-visible payload plus the card.
+      const payload = result.structuredContent as Record<string, unknown>;
       expect(payload.AgentId).toBe(onlineAgent.AgentId);
       expect(payload.AgentName).toBe(onlineAgent.AgentName);
       expect(payload._card).toEqual({
@@ -173,13 +177,14 @@ describe("MCP Apps device card", () => {
       });
     });
 
-    it("returns the raw payload without _card when the agent is unrecognizable", async () => {
+    it("returns the raw payload without _card or structuredContent when the agent is unrecognizable", async () => {
       mockAgentsGet.mockResolvedValue({ unexpected: "shape" });
       const client = await connect();
       const result = await client.callTool({
         name: "kaseya_vsa_get_agent",
         arguments: { agentId: "x" },
       });
+      expect(result.structuredContent).toBeUndefined();
       const [first] = result.content as Array<{ type: string; text: string }>;
       const payload = JSON.parse(first.text);
       expect(payload).toEqual({ unexpected: "shape" });
