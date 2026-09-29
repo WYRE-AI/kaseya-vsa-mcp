@@ -323,6 +323,22 @@ describe("kaseya_vsa_deploy_patches_now", () => {
     expect(mockDeployNow).not.toHaveBeenCalled();
   });
 
+  it("cancels without calling the client when the user sends an elicitation-level decline", async () => {
+    // action:"decline" is a different protocol outcome from content:{confirm:false}
+    // (the user closing the prompt vs. answering its boolean field false) --
+    // elicitConfirmation's `result.action === "accept" && result.content`
+    // guard means both currently land on the same `ok !== true` cancellation
+    // path here, but that's worth pinning explicitly rather than assuming.
+    const client = await connectElicitingClient(CREDS, { action: "decline" });
+    const result = (await client.callTool({
+      name: "kaseya_vsa_deploy_patches_now",
+      arguments: { agentId: "a1" },
+    })) as ToolResult;
+    expect(result.isError).toBeFalsy();
+    expect(text(result)).toBe("Patch deploy cancelled by user.");
+    expect(mockDeployNow).not.toHaveBeenCalled();
+  });
+
   it("cancels without calling the client when confirmation is unsupported", async () => {
     const client = await connectClient(CREDS);
     const result = (await client.callTool({
@@ -360,8 +376,19 @@ describe("kaseya_vsa_run_procedure", () => {
     expect(JSON.parse(text(result))).toEqual({ status: "started" });
   });
 
-  it("cancels without calling the client when the user declines", async () => {
+  it("cancels without calling the client when the user answers the confirm field false", async () => {
     const client = await connectElicitingClient(CREDS, { action: "accept", content: { confirm: false } });
+    const result = (await client.callTool({
+      name: "kaseya_vsa_run_procedure",
+      arguments: { agentId: "a1", procedureId: "p1" },
+    })) as ToolResult;
+    expect(result.isError).toBeFalsy();
+    expect(text(result)).toBe("Procedure execution cancelled by user.");
+    expect(mockRunNow).not.toHaveBeenCalled();
+  });
+
+  it("cancels without calling the client when the user sends an elicitation-level decline", async () => {
+    const client = await connectElicitingClient(CREDS, { action: "decline" });
     const result = (await client.callTool({
       name: "kaseya_vsa_run_procedure",
       arguments: { agentId: "a1", procedureId: "p1" },
