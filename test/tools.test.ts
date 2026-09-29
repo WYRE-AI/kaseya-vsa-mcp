@@ -94,10 +94,18 @@ async function connectClient(
   return client;
 }
 
-/** A Client that declares elicitation support and answers every prompt with a fixed response. */
+type ElicitResponse = { action: "accept" | "decline" | "cancel"; content?: Record<string, unknown> };
+
+/**
+ * A Client that declares elicitation support. `response` is either a single
+ * fixed answer for every prompt, or a function keyed on the requested
+ * field's name -- needed for a multi-step flow like resolveAgentFilter's
+ * org picker, which asks two different questions ("scope" then "orgRef")
+ * in sequence and needs a different answer for each.
+ */
 async function connectElicitingClient(
   creds: { baseUrl: string; username?: string; password?: string; kaseyaOneToken?: string },
-  response: { action: "accept" | "decline" | "cancel"; content?: Record<string, unknown> }
+  response: ElicitResponse | ((fieldName: string) => ElicitResponse)
 ): Promise<Client> {
   const server = createMcpServer(creds);
   bindServerRef(server);
@@ -105,7 +113,13 @@ async function connectElicitingClient(
     { name: "test-host", version: "0.0.0" },
     { capabilities: { elicitation: { form: {} } } }
   );
-  client.setRequestHandler(ElicitRequestSchema, async () => response);
+  client.setRequestHandler(ElicitRequestSchema, async (request) => {
+    if (typeof response === "function") {
+      const fieldName = Object.keys(request.params.requestedSchema.properties)[0];
+      return response(fieldName);
+    }
+    return response;
+  });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([
     server.connect(serverTransport),
@@ -194,16 +208,29 @@ describe("kaseya_vsa_list_agents", () => {
     expect(mockAgentsList).toHaveBeenCalledWith({ top: 2000, skip: undefined, filter: "x" });
   });
 
-  it("lists organizations and builds an OrgRef filter when the user picks the org scope", async () => {
+  it("lists organizations and builds an OrgRef filter when the user picks an org", async () => {
     mockOrganizationsList.mockResolvedValue([{ orgRef: "acme", orgName: "Acme Corp" }]);
     mockAgentsList.mockResolvedValue([]);
+    // Two different questions get asked in sequence (scope, then orgRef) --
+    // answer each by its field name so this actually exercises a real pick,
+    // not just the picker branch being entered.
+    const client = await connectElicitingClient(CREDS, (fieldName) =>
+      fieldName === "scope"
+        ? { action: "accept", content: { scope: "__org__" } }
+        : { action: "accept", content: { orgRef: "acme" } }
+    );
+    await client.callTool({ name: "kaseya_vsa_list_agents", arguments: {} });
+    expect(mockOrganizationsList).toHaveBeenCalled();
+    expect(mockAgentsList).toHaveBeenCalledWith({ top: 100, skip: undefined, filter: "OrgRef eq 'acme'" });
+  });
+
+  it("returns no filter when the org picker is entered but nothing gets picked", async () => {
+    mockOrganizationsList.mockResolvedValue([{ orgRef: "acme", orgName: "Acme Corp" }]);
+    mockAgentsList.mockResolvedValue([]);
+    // A fixed responder that only answers the first ("scope") question
+    // leaves the second ("orgRef") prompt's content field absent, which is
+    // exactly what a client declining/ignoring the second prompt looks like.
     const client = await connectElicitingClient(CREDS, { action: "accept", content: { scope: "__org__" } });
-    // The second elicitation call (picking the org itself) reuses the same
-    // fixed handler above, which only returns {scope: "__org__"} -- so
-    // elicitSelection's second call receives content without an "orgRef"
-    // key and resolves picked to undefined, taking the "no org picked"
-    // path. Assert the org list was still queried, which is the real
-    // behavior under test here (the picker branch, not a specific pick).
     await client.callTool({ name: "kaseya_vsa_list_agents", arguments: {} });
     expect(mockOrganizationsList).toHaveBeenCalled();
     expect(mockAgentsList).toHaveBeenCalledWith({ top: 100, skip: undefined, filter: undefined });
