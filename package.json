@@ -42,7 +42,7 @@
   },
   "homepage": "https://github.com/WYRE-AI/kaseya-vsa-mcp#readme",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.31.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "@wyre-technology/node-kaseya-vsa": "^1.0.1"
   },
   "devDependencies": {
