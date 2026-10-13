@@ -45,9 +45,12 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 ENV NODE_ENV=production
 ENV MCP_TRANSPORT=http
 ENV MCP_HTTP_PORT=8080
+# All interfaces inside the container. Startup still refuses to run without a
+# real CONDUIT_S2S_SECRET. MCP_ALLOW_INSECURE_DEV=1 forces 127.0.0.1 even
+# while this host is 0.0.0.0.
 ENV MCP_HTTP_HOST=0.0.0.0
-# Default to env mode for backward compatibility; set to 'gateway' for hosted deployment
-ENV AUTH_MODE=env
+# Gateway mode reads Kaseya credentials from X-Kaseya-VSA-* headers only.
+ENV AUTH_MODE=gateway
 
 CMD ["node", "dist/index.js"]
 

@@ -4,8 +4,15 @@
  *
  * This MCP server provides tools for interacting with the Kaseya VSA RMM API.
  * It accepts credentials via environment variables (env mode) or per-request
- * HTTP headers (gateway mode). Supports both stdio (default) and HTTP
- * (StreamableHTTP) transports.
+ * HTTP headers (gateway mode). Gateway mode never falls back to KASEYA_VSA_*
+ * env credentials. Supports both stdio (default) and HTTP (StreamableHTTP)
+ * transports.
+ *
+ * HTTP transport refuses to start unless CONDUIT_S2S_SECRET is a real secret.
+ * MCP_ALLOW_INSECURE_DEV=1 is a local-only escape hatch: it logs a warning and
+ * forces the listener onto 127.0.0.1. Known placeholder secrets are rejected
+ * even with that flag. /health stays unauthenticated and does not read
+ * credentials. stdio does not use S2S auth.
  */
 
 import { createServer, IncomingMessage, ServerResponse, Server as HttpServer } from "node:http";
@@ -32,8 +39,6 @@ import {
 } from "./device-card.js";
 import { DEVICE_CARD_HTML } from "./generated/device-card-html.js";
 import { verifyS2sHeader, S2S_HEADER } from "./s2s-verify.js";
-
-const S2S_SECRET = process.env.CONDUIT_S2S_SECRET || "";
 
 // ---------------------------------------------------------------------------
 // Credentials
@@ -578,21 +583,114 @@ async function startStdioTransport(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP service-to-service auth
+// ---------------------------------------------------------------------------
+
+/**
+ * Public example values. A copied placeholder must not verify as a real
+ * secret. Matched case-insensitively after trim. Never log the value.
+ * Unresolved `${...}` manifest placeholders are rejected too.
+ */
+const KNOWN_PLACEHOLDER_SECRETS = new Set([
+  "replace-with-a-real-secret",
+  "your-s2s-secret",
+  "your-secret",
+  "changeme",
+  "change-me",
+  "placeholder",
+  "secret",
+  "example",
+  "replace-me",
+  "s2s-secret",
+]);
+
+const LOOPBACK_HOST = "127.0.0.1";
+
+const MISSING_S2S_SECRET_ERROR =
+  "Refusing to start HTTP transport: CONDUIT_S2S_SECRET is empty. " +
+  "Set CONDUIT_S2S_SECRET to the gateway-provisioned secret (openssl rand -hex 32), " +
+  "or set MCP_ALLOW_INSECURE_DEV=1 for local development only.";
+
+const PLACEHOLDER_S2S_SECRET_ERROR =
+  "Refusing to start HTTP transport: CONDUIT_S2S_SECRET is a known placeholder. " +
+  "Generate a secret with openssl rand -hex 32 and set CONDUIT_S2S_SECRET to that value.";
+
+const INSECURE_DEV_WARNING =
+  "SECURITY WARNING: CONDUIT_S2S_SECRET is empty and MCP_ALLOW_INSECURE_DEV=1. " +
+  "HTTP /mcp is not enforcing X-Gateway-S2S and is bound to 127.0.0.1 only. " +
+  "Do not use this outside local development.";
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/^\[(.+)\]$/, "$1");
+  if (normalized === "localhost" || normalized === "::1") return true;
+  const bare = normalized.startsWith("::ffff:") ? normalized.slice("::ffff:".length) : normalized;
+  const parts = bare.split(".");
+  if (parts.length !== 4) return false;
+  if (parts.some((part) => !/^\d{1,3}$/.test(part) || Number(part) > 255)) return false;
+  return parts[0] === "127";
+}
+
+/**
+ * Secret for X-Gateway-S2S on /mcp. Read at HTTP startup, not module load.
+ * Empty is fail-closed unless MCP_ALLOW_INSECURE_DEV=1. A known placeholder
+ * always refuses to start. The secret value is never written to logs.
+ */
+function resolveHttpS2sSecret(): { secret: string; insecureDev: boolean } {
+  const raw = (process.env.CONDUIT_S2S_SECRET ?? "").trim();
+  if (KNOWN_PLACEHOLDER_SECRETS.has(raw.toLowerCase()) || CONFIG_PLACEHOLDER.test(raw)) {
+    console.error(PLACEHOLDER_S2S_SECRET_ERROR);
+    process.exit(1);
+  }
+  if (raw) return { secret: raw, insecureDev: false };
+  if (process.env.MCP_ALLOW_INSECURE_DEV === "1") {
+    console.error(INSECURE_DEV_WARNING);
+    return { secret: "", insecureDev: true };
+  }
+  console.error(MISSING_S2S_SECRET_ERROR);
+  process.exit(1);
+}
+
+/**
+ * With a real secret, honor MCP_HTTP_HOST (default 127.0.0.1 when unset).
+ * Without a secret the insecure-dev bypass forces 127.0.0.1, including when
+ * MCP_HTTP_HOST is a wider address such as 0.0.0.0.
+ */
+function resolveBindHost(hasRealSecret: boolean): string {
+  const configured = (process.env.MCP_HTTP_HOST ?? "").trim();
+  if (hasRealSecret) return configured || LOOPBACK_HOST;
+  if (configured && !isLoopbackHost(configured)) {
+    console.error(
+      `WARNING: MCP_HTTP_HOST=${configured} is not a loopback address. ` +
+        "MCP_ALLOW_INSECURE_DEV=1 without CONDUIT_S2S_SECRET forces the listener to 127.0.0.1 only."
+    );
+  }
+  return LOOPBACK_HOST;
+}
+
+function headerValue(value: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+// ---------------------------------------------------------------------------
 // Transport: HTTP (StreamableHTTPServerTransport)
 // ---------------------------------------------------------------------------
 
 let httpServer: HttpServer | undefined;
 
-async function startHttpTransport(): Promise<void> {
+export async function startHttpTransport(): Promise<HttpServer> {
   const port = parseInt(process.env.MCP_HTTP_PORT || "8080", 10);
-  const host = process.env.MCP_HTTP_HOST || "0.0.0.0";
+  const { secret: s2sSecret, insecureDev } = resolveHttpS2sSecret();
+  const host = resolveBindHost(!insecureDev);
   const authMode = process.env.AUTH_MODE || "env";
   const isGatewayMode = authMode === "gateway";
 
   httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
-    // Health endpoint - no auth required
+    // Health endpoint — unauthenticated liveness. Must not read credentials.
     if (url.pathname === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
@@ -607,7 +705,10 @@ async function startHttpTransport(): Promise<void> {
     }
 
     if (url.pathname === "/mcp") {
-      if (S2S_SECRET && !verifyS2sHeader(req.headers[S2S_HEADER] as string | undefined, S2S_SECRET)) {
+      // Empty s2sSecret is only reachable when MCP_ALLOW_INSECURE_DEV=1.
+      // A configured secret is always enforced, before credential extraction.
+      const s2sHeader = headerValue(req.headers[S2S_HEADER]);
+      if (s2sSecret && !verifyS2sHeader(s2sHeader, s2sSecret)) {
         res.writeHead(401, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
@@ -631,13 +732,14 @@ async function startHttpTransport(): Promise<void> {
 
       // In gateway mode, extract credentials from headers and pass directly
       // to avoid process.env race conditions under concurrent load.
+      // Missing headers are rejected. Falling through would resolve
+      // KASEYA_VSA_* from the process environment, which is not request-scoped.
       let gatewayCredentials: KaseyaVsaCredentials | undefined;
       if (isGatewayMode) {
-        const headers = req.headers as Record<string, string | string[] | undefined>;
-        const baseUrl = cleanCredential(headers["x-kaseya-vsa-tenant-url"] as string | undefined);
-        const username = cleanCredential(headers["x-kaseya-vsa-username"] as string | undefined);
-        const password = cleanCredential(headers["x-kaseya-vsa-password"] as string | undefined);
-        const kaseyaOneToken = cleanCredential(headers["x-kaseya-vsa-k1-token"] as string | undefined);
+        const baseUrl = cleanCredential(headerValue(req.headers["x-kaseya-vsa-tenant-url"]));
+        const username = cleanCredential(headerValue(req.headers["x-kaseya-vsa-username"]));
+        const password = cleanCredential(headerValue(req.headers["x-kaseya-vsa-password"]));
+        const kaseyaOneToken = cleanCredential(headerValue(req.headers["x-kaseya-vsa-k1-token"]));
 
         const hasLocal = !!(username && password);
         if (!baseUrl || (!hasLocal && !kaseyaOneToken)) {
@@ -704,8 +806,11 @@ async function startHttpTransport(): Promise<void> {
     res.end(JSON.stringify({ error: "Not found", endpoints: ["/mcp", "/health"] }));
   });
 
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: Error) => reject(err);
+    httpServer!.once("error", onError);
     httpServer!.listen(port, host, () => {
+      httpServer!.off("error", onError);
       console.error(`Kaseya VSA MCP server listening on http://${host}:${port}/mcp`);
       console.error(`Health check available at http://${host}:${port}/health`);
       console.error(
@@ -714,6 +819,8 @@ async function startHttpTransport(): Promise<void> {
       resolve();
     });
   });
+
+  return httpServer;
 }
 
 // ---------------------------------------------------------------------------
