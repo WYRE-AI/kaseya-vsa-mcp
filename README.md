@@ -42,32 +42,32 @@ other hosts. After editing `ui/`, regenerate the embedded bundle with
 
 ## Configuration
 
-### Environment-variable mode (default)
+Copy [`.env.example`](.env.example) and set the variables below.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `KASEYA_VSA_TENANT_URL` | yes | Full base URL incl. `/api/v1.0` |
-| `KASEYA_VSA_USERNAME` | one of | Local-auth username |
-| `KASEYA_VSA_PASSWORD` | one of | Local-auth password (secret) |
-| `KASEYA_VSA_K1_TOKEN` | one of | Kaseya One SSO token (alternative to username + password) |
-| `MCP_TRANSPORT` | no | `stdio` (default) or `http` |
-| `MCP_HTTP_PORT` | no | HTTP listen port (default `8080`) |
-| `AUTH_MODE` | no | `env` (default) or `gateway` |
+| `KASEYA_VSA_TENANT_URL` | For stdio and `AUTH_MODE=env` | Full base URL incl. `/api/v1.0`. The Compose gateway service does not load this. |
+| `KASEYA_VSA_USERNAME` | For stdio and `AUTH_MODE=env` | Local-auth username (with password). The Compose gateway service does not load this. |
+| `KASEYA_VSA_PASSWORD` | For stdio and `AUTH_MODE=env` | Local-auth password (secret). The Compose gateway service does not load this. |
+| `KASEYA_VSA_K1_TOKEN` | For stdio and `AUTH_MODE=env` | Kaseya One SSO token (alternative to username + password). The Compose gateway service does not load this. |
+| `MCP_TRANSPORT` | No | `stdio` (default) or `http` |
+| `AUTH_MODE` | No | `gateway` (Docker image and Compose default) or `env` (code default when unset). Gateway mode requires the `X-Kaseya-VSA-*` headers on each `/mcp` request and never falls back to `KASEYA_VSA_*`. `env` uses those variables only after S2S auth succeeds. |
+| `CONDUIT_S2S_SECRET` | Yes for HTTP | Service-to-service secret. Generate with `openssl rand -hex 32`. The HTTP server logs an error and exits non-zero when this is empty or a known placeholder (`changeme`, `your-s2s-secret`, `secret`, `placeholder`, an unresolved `${...}` value, and similar public examples). Compose will not start without it. Never commit a real value. The value is never logged. |
+| `MCP_ALLOW_INSECURE_DEV` | No | Set to exactly `1` only for local development to start HTTP without `CONDUIT_S2S_SECRET`. The process logs a warning, does not enforce `X-Gateway-S2S`, and forces the listener onto `127.0.0.1` even if `MCP_HTTP_HOST` is a wider address. A known placeholder secret is still refused. |
+| `MCP_HTTP_HOST` | No | Bind address when `MCP_TRANSPORT=http`. Defaults to `127.0.0.1` when unset. A configured `CONDUIT_S2S_SECRET` honors this value. The container image sets `0.0.0.0`. |
+| `MCP_HTTP_PORT` | No | HTTP port. Defaults to `8080`. |
 
-Either the username + password pair OR the `KASEYA_VSA_K1_TOKEN` is required.
+Either the username + password pair OR `KASEYA_VSA_K1_TOKEN` is required for stdio and `AUTH_MODE=env`.
 
-### Gateway mode
+`/health` stays unauthenticated and does not read credentials. The stdio transport does not use `CONDUIT_S2S_SECRET`.
 
-When deployed behind the WYRE MCP Gateway, set `AUTH_MODE=gateway` and the
-server will read credentials from per-request HTTP headers:
+### HTTP authentication
 
-- `X-Kaseya-VSA-Tenant-Url` (required)
-- `X-Kaseya-VSA-Username` (with password)
-- `X-Kaseya-VSA-Password` (with username)
-- `X-Kaseya-VSA-K1-Token` (alternative to username + password)
+With `MCP_TRANSPORT=http` and `CONDUIT_S2S_SECRET` set, every `/mcp` request must include `X-Gateway-S2S`. The check is `verifyS2sHeader` in [`src/s2s-verify.ts`](src/s2s-verify.ts): the header value is `t=<unix seconds>,v1=<hex>`, where the hex is HMAC-SHA256 of the literal string `t=<unix seconds>` keyed with `CONDUIT_S2S_SECRET` (64 lowercase hex characters). The timestamp must be within 300 seconds of the server clock. A missing or invalid header returns HTTP 401 before vendor credentials are read.
 
-Each request creates a fresh server instance with isolated credentials — no
-cross-tenant `process.env` pollution.
+In `AUTH_MODE=gateway`, `/mcp` also requires `X-Kaseya-VSA-Tenant-Url` plus either (`X-Kaseya-VSA-Username` and `X-Kaseya-VSA-Password`) or `X-Kaseya-VSA-K1-Token`. Those headers are the only credential source for that request. A request missing them returns 401 and does not fall back to `KASEYA_VSA_*` in the process environment.
+
+Each accepted request creates a fresh server instance with isolated credentials — no cross-tenant `process.env` pollution.
 
 ## Local development
 
@@ -80,21 +80,47 @@ KASEYA_VSA_TENANT_URL=https://vsa.example.com/api/v1.0 \
   npm start
 ```
 
-Run as HTTP for testing:
+HTTP refuses to start until `CONDUIT_S2S_SECRET` is set:
 
 ```bash
-MCP_TRANSPORT=http npm start
-curl http://localhost:8080/health
+CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" MCP_TRANSPORT=http npm start
+curl http://127.0.0.1:8080/health
+```
+
+Local HTTP without a secret is development-only. It binds `127.0.0.1` only and logs a warning. A non-loopback `MCP_HTTP_HOST` is ignored and the override is logged:
+
+```bash
+MCP_TRANSPORT=http MCP_ALLOW_INSECURE_DEV=1 npm start
 ```
 
 ## Docker
 
+The image listens on `0.0.0.0` inside the container (`MCP_HTTP_HOST`) and defaults to `AUTH_MODE=gateway`. Publish the port on loopback and pass the S2S secret. In gateway mode, Kaseya credentials arrive on each request as headers; they are not read from the environment.
+
 ```bash
 docker build -t kaseya-vsa-mcp .
-docker run --rm -p 8080:8080 \
+docker run --rm \
+  -e CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" \
+  -p 127.0.0.1:8080:8080 \
+  kaseya-vsa-mcp
+```
+
+Compose refuses to start when `CONDUIT_S2S_SECRET` is unset, sets `AUTH_MODE=gateway`, does not inject static `KASEYA_VSA_*` credentials, and publishes `127.0.0.1:8080:8080`:
+
+```bash
+CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" docker compose up
+```
+
+Single-tenant HTTP (`AUTH_MODE=env`) still requires the S2S secret, then uses `KASEYA_VSA_*`:
+
+```bash
+docker run --rm \
+  -e CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" \
+  -e AUTH_MODE=env \
   -e KASEYA_VSA_TENANT_URL=https://vsa.example.com/api/v1.0 \
   -e KASEYA_VSA_USERNAME=... \
   -e KASEYA_VSA_PASSWORD=... \
+  -p 127.0.0.1:8080:8080 \
   kaseya-vsa-mcp
 ```
 
