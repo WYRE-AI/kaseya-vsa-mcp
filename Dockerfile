@@ -31,7 +31,8 @@ COPY package*.json ./
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
 
-RUN npm cache clean --force
+# The runtime only executes node; drop the bundled npm CLI (and its CVE-prone deps)
+RUN npm cache clean --force && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
 RUN mkdir -p /app/logs && chown -R kaseya:kaseya /app
 
