@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The HTTP transport no longer exits on a malformed request (WYREAI-741).** The request
+  target was parsed against the client-supplied `Host` header, and a value that does not parse
+  (or a target such as `//`) threw inside the request listener before authentication. The
+  target is now parsed against a fixed base, so `Host` is no longer consulted, and a target
+  that still cannot be parsed gets a `400` JSON response while the server keeps running.
+
 - Ignore unresolved MCPB/DXT config placeholders (`${user_config.X}`) in credentials. A blank optional Kaseya One token field caused Claude Desktop to inject the literal `${user_config.kaseya_vsa_k1_token}` string, which was preferred over valid local username/password and made every request authenticate with a bogus SSO token (401). Empty, whitespace-only, and placeholder credential values are now normalised to "absent" at ingress for both env and gateway-header sources (mirrors itglue-mcp #73).
 
 ### Added
